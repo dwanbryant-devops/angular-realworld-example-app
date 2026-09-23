@@ -1,16 +1,14 @@
-import 'zone.js';
-import 'zone.js/testing';
+import { NgModule, provideZonelessChangeDetection } from '@angular/core';
 import { getTestBed } from '@angular/core/testing';
 import { BrowserDynamicTestingModule, platformBrowserDynamicTesting } from '@angular/platform-browser-dynamic/testing';
 
-console.log('🚀 Test setup file is being loaded!');
+// The app is zoneless (provideZonelessChangeDetection in app.config.ts) and zone.js is
+// not a dependency, so tests run zoneless too.
+@NgModule({ providers: [provideZonelessChangeDetection()] })
+class ZonelessTestingModule {}
 
-// Initialize the Angular testing environment once
-try {
-  getTestBed().initTestEnvironment(BrowserDynamicTestingModule, platformBrowserDynamicTesting(), {
-    teardown: { destroyAfterEach: true },
-  });
-  console.log('✅ TestBed initialized successfully');
-} catch (error) {
-  console.error('❌ TestBed initialization failed:', error);
-}
+const testingModules = [BrowserDynamicTestingModule, ZonelessTestingModule];
+
+getTestBed().initTestEnvironment(testingModules, platformBrowserDynamicTesting(), {
+  teardown: { destroyAfterEach: true },
+});
