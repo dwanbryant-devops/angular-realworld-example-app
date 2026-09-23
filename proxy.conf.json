@@ -1,0 +1,7 @@
+{
+  "/api": {
+    "target": "https://api.realworld.show",
+    "secure": true,
+    "changeOrigin": true
+  }
+}
