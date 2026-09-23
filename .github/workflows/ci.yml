@@ -1,0 +1,156 @@
+# UI pipeline
+#   PR:          format check + unit tests + e2e (Playwright) + image build/scan/smoke test
+#   push main:   same gates -> push image to ECR (OIDC, `dev` environment) -> bump tag in
+#                incode-gitops -> Argo CD rolls it out.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: incode/ui
+  AWS_REGION: us-east-1
+
+jobs:
+  lint-unit:
+    name: Format + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run format:check
+      - run: bun run test
+        env:
+          CI: true
+
+  e2e:
+    name: E2E (Playwright)
+    # The shared RealWorld e2e specs run against the public demo API (dev build config),
+    # so they gate PRs but not deploys (an outage there shouldn't block releases).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx playwright install --with-deps chromium
+      - run: bun run test:e2e
+        env:
+          CI: true
+      - run: bun run test:e2e:security
+        env:
+          CI: true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+  image:
+    name: Build + scan + smoke test image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Trivy scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Smoke test (read-only rootfs, as in the cluster)
+        run: |
+          docker run -d --name ui -p 8080:8080 --read-only --tmpfs /tmp ${{ env.IMAGE_NAME }}:ci
+          for i in $(seq 1 20); do curl -sf localhost:8080/healthz && break; sleep 1; done
+          curl -sf localhost:8080/ | grep -q "<app-root"
+          curl -sf localhost:8080/article/some-slug | grep -q "<app-root" # SPA fallback
+          curl -sI localhost:8080/ | grep -qi "x-frame-options: DENY"
+      - name: Save image
+        run: docker save ${{ env.IMAGE_NAME }}:ci | gzip > image.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ui-image
+          path: image.tar.gz
+          retention-days: 1
+
+  publish:
+    name: Push image to ECR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint-unit, image]
+    runs-on: ubuntu-latest
+    environment: dev # holds AWS_ROLE_ARN; restricted to main, so the OIDC sub is environment:dev
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ui-image
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Push (tags are immutable in ECR)
+        run: |
+          docker load < image.tar.gz
+          REF="${{ steps.ecr.outputs.registry }}/$IMAGE_NAME:${{ steps.meta.outputs.tag }}"
+          docker tag $IMAGE_NAME:ci "$REF"
+          docker push "$REF"
+          echo "Pushed \`$REF\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    name: Deploy to dev (GitOps)
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency: gitops-dev # serialize tag bumps with the API pipeline
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: dwanbryant-devops/incode-gitops
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+      - name: Bump ui image tag
+        working-directory: gitops
+        run: |
+          TAG="${{ needs.publish.outputs.tag }}"
+          yq -i ".ui.image.tag = \"$TAG\"" values/dev/realworld.yaml
+          git config user.name "incode-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git commit -am "dev: ui -> $TAG (${GITHUB_REPOSITORY}@${GITHUB_SHA::12})"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 3; done
+          echo "Argo CD will roll out \`$TAG\` to dev." >> "$GITHUB_STEP_SUMMARY"
