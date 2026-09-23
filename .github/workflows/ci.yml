@@ -39,8 +39,8 @@ jobs:
 
   e2e:
     name: E2E (Playwright)
-    # The shared RealWorld e2e specs run against the public demo API through the dev-server
-    # proxy, so they gate PRs but not deploys (an outage there shouldn't block releases).
+    # The shared RealWorld e2e specs run against the public demo API (dev build config),
+    # so they gate PRs but not deploys (an outage there shouldn't block releases).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
